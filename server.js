@@ -136,11 +136,20 @@ app.post("/api/register/verify", async (req, res) => {
       return res.status(400).json({ error: "검증 실패" });
     }
 
-    const { credential } = verification.registrationInfo;
+    const info = verification.registrationInfo;
+    // @simplewebauthn/server 버전에 따라 registrationInfo의 필드 이름이 다르다.
+    // 신버전: info.credential.{id, publicKey, counter}
+    // 구버전: info.credentialID / info.credentialPublicKey / info.counter
+    const cred = info.credential ?? {
+      id: Buffer.from(info.credentialID).toString("base64url"),
+      publicKey: info.credentialPublicKey,
+      counter: info.counter,
+    };
+
     user.credentials.push({
-      credentialID: credential.id,
-      publicKey: Buffer.from(credential.publicKey).toString("base64"),
-      counter: credential.counter,
+      credentialID: cred.id,
+      publicKey: Buffer.from(cred.publicKey).toString("base64"),
+      counter: cred.counter,
       name: nickname || `패스키 ${user.credentials.length + 1}`,
       createdAt: new Date().toISOString(),
     });
@@ -205,9 +214,16 @@ app.post("/api/login/verify", async (req, res) => {
       expectedChallenge: pending.challenge,
       expectedOrigin: ORIGIN,
       expectedRPID: RP_ID,
+      // 버전에 따라 신버전은 credential, 구버전은 authenticator 파라미터를 쓴다.
+      // 둘 다 넘겨두면 설치된 버전이 필요한 쪽만 읽고 나머지는 무시한다.
       credential: {
         id: cred.credentialID,
         publicKey: Buffer.from(cred.publicKey, "base64"),
+        counter: cred.counter,
+      },
+      authenticator: {
+        credentialID: Buffer.from(cred.credentialID, "base64url"),
+        credentialPublicKey: Buffer.from(cred.publicKey, "base64"),
         counter: cred.counter,
       },
     });
