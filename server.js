@@ -290,9 +290,13 @@ app.get("/api/me", (req, res) => {
 
 // 디버그용: 프론트 라이브러리 버전을 서버와 정확히 맞추기 위해 실제 설치된 버전을 확인
 app.get("/api/debug/version", (req, res) => {
-  res.json({
-    "@simplewebauthn/server": require("@simplewebauthn/server/package.json").version,
-  });
+  try {
+    const pkgPath = path.join(__dirname, "node_modules", "@simplewebauthn", "server", "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    res.json({ "@simplewebauthn/server": pkg.version });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
 });
 
 app.listen(PORT, () => console.log(`listening on ${PORT}`));
