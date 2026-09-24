@@ -151,6 +151,7 @@ app.post("/api/register/verify", async (req, res) => {
 
     res.json({ verified: true });
   } catch (e) {
+    console.error("register/verify 오류:", e);
     res.status(400).json({ error: String(e) });
   }
 });
@@ -227,6 +228,7 @@ app.post("/api/login/verify", async (req, res) => {
 
     res.json({ verified: true, username: user.username, sessionToken });
   } catch (e) {
+    console.error("login/verify 오류:", e);
     res.status(400).json({ error: String(e) });
   }
 });
