@@ -1,9 +1,10 @@
 // 과제 8 - 패스키(WebAuthn) 백엔드
 // 등록(register) / 로그인(login) / 로그아웃(logout) / 비공개 자료 조회(/api/private) 를 처리한다.
+// 프론트(GitHub Pages)와 백엔드(Render)가 서로 다른 도메인이라 교차 사이트 쿠키가
+// 브라우저에 따라 차단될 수 있어, 쿠키 대신 "토큰을 응답 본문으로 주고받는" 방식을 쓴다.
 // 저장소는 과제용으로 단순화하기 위해 JSON 파일을 사용한다. (실서비스라면 DB를 쓸 것)
 
 const express = require("express");
-const session = require("express-session");
 const cors = require("cors");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -18,41 +19,18 @@ const {
 const app = express();
 
 // ---- 환경설정 -------------------------------------------------------
-// RP = Relying Party. 프론트엔드가 떠 있는 origin과 정확히 일치해야 한다.
 const RP_NAME = "패스키 소개 페이지";
-const RP_ID = process.env.RP_ID || "zzinyy.github.io"; // 도메인만 (스킴/포트 제외)
-const ORIGIN = process.env.ORIGIN || "https://zzinyy.github.io"; // 프론트엔드 origin
+const RP_ID = process.env.RP_ID || "zzinyy.github.io";
+const ORIGIN = process.env.ORIGIN || "https://zzinyy.github.io";
 const PORT = process.env.PORT || 3000;
-const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me";
 
 app.use(express.json());
-app.use(
-  cors({
-    origin: ORIGIN,
-    credentials: true,
-  })
-);
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: true, // https 필수 (배포 환경)
-      sameSite: "none", // 프론트/백엔드 도메인이 다르므로 필요
-      maxAge: 1000 * 60 * 60 * 24 * 7,
-    },
-  })
-);
+app.use(cors({ origin: ORIGIN }));
 
 // ---- 아주 단순한 JSON 파일 저장소 ------------------------------------
 const DB_PATH = path.join(__dirname, "data", "db.json");
 function loadDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    return { users: {} };
-    // users[userId] = { id, username, credentials: [{credentialID, publicKey, counter, name, createdAt}] }
-  }
+  if (!fs.existsSync(DB_PATH)) return { users: {} };
   return JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
 }
 function saveDB(db) {
@@ -60,19 +38,29 @@ function saveDB(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
-// 등록/로그인 중 발급한 challenge를 잠깐 들고 있는 저장소 (메모리, 세션별)
-// 실서비스라면 만료시간을 두고 DB나 redis에 저장해야 한다.
-const pendingChallenges = new Map(); // key: userId or "anon:"+sessionID, value: { challenge, createdAt }
+// ---- 토큰 기반 세션 (쿠키 대신) ----------------------------------------
+// pendingSessions: 등록/로그인 "진행 중" 상태만 짧게 들고 있는 토큰
+// authSessions: 로그인 완료 후 발급하는 토큰 (Authorization: Bearer 로 보내옴)
+const pendingSessions = new Map(); // token -> { userId, createdAt }
+const authSessions = new Map(); // token -> { userId, username, createdAt }
+function newToken() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+function getBearerToken(req) {
+  const h = req.headers.authorization || "";
+  return h.startsWith("Bearer ") ? h.slice(7) : null;
+}
+
+// 등록/로그인 중 발급한 WebAuthn challenge (userId 기준으로 서버가 보관)
+const pendingChallenges = new Map(); // key: "reg:"+userId 또는 "auth:"+userId
+const usedChallenges = new Set(); // 이미 쓴 로그인 challenge 재사용 방지
 
 function getUserByUsername(db, username) {
   return Object.values(db.users).find((u) => u.username === username);
 }
 
-// 이미 쓴 로그인 challenge 재사용을 막기 위한 기록
-const usedChallenges = new Set();
-
 // ---- 데모용 비공개 콘텐츠 (계정별) -----------------------------------
-const PRIVATE_CONTENT = {}; // userId -> array of items, seedPrivateContent()에서 채움
+const PRIVATE_CONTENT = {};
 function seedPrivateContent(userId, username) {
   if (PRIVATE_CONTENT[userId]) return;
   PRIVATE_CONTENT[userId] = [
@@ -83,9 +71,11 @@ function seedPrivateContent(userId, username) {
 }
 
 function requireAuth(req, res, next) {
-  if (!req.session.userId) {
-    return res.status(401).json({ error: "로그인이 필요합니다." });
-  }
+  const token = getBearerToken(req);
+  const session = token && authSessions.get(token);
+  if (!session) return res.status(401).json({ error: "로그인이 필요합니다." });
+  req.userId = session.userId;
+  req.username = session.username;
   next();
 }
 
@@ -108,27 +98,24 @@ app.post("/api/register/options", async (req, res) => {
     userID: Buffer.from(user.id),
     userName: user.username,
     attestationType: "none",
-    excludeCredentials: user.credentials.map((c) => ({
-      id: c.credentialID,
-      type: "public-key",
-    })),
-    authenticatorSelection: {
-      residentKey: "preferred",
-      userVerification: "preferred",
-    },
+    excludeCredentials: user.credentials.map((c) => ({ id: c.credentialID, type: "public-key" })),
+    authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
   });
 
-  // challenge는 서버가 직접 들고 있는다 (클라이언트를 믿지 않는다)
   pendingChallenges.set("reg:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
-  req.session.pendingUserId = user.id;
 
-  res.json(options);
+  const regToken = newToken();
+  pendingSessions.set(regToken, { userId: user.id, createdAt: Date.now() });
+
+  res.json({ ...options, regToken });
 });
 
 // ---- 등록: 2) 응답 검증 -----------------------------------------------
 app.post("/api/register/verify", async (req, res) => {
-  const userId = req.session.pendingUserId;
-  if (!userId) return res.status(400).json({ error: "등록 세션이 없습니다." });
+  const { attResp, nickname, regToken } = req.body;
+  const pendingSession = regToken && pendingSessions.get(regToken);
+  if (!pendingSession) return res.status(400).json({ error: "등록 세션이 없습니다." });
+  const userId = pendingSession.userId;
 
   const pending = pendingChallenges.get("reg:" + userId);
   if (!pending) return res.status(400).json({ error: "만료되었거나 없는 challenge입니다." });
@@ -139,7 +126,7 @@ app.post("/api/register/verify", async (req, res) => {
 
   try {
     const verification = await verifyRegistrationResponse({
-      response: req.body.attResp,
+      response: attResp,
       expectedChallenge: pending.challenge,
       expectedOrigin: ORIGIN,
       expectedRPID: RP_ID,
@@ -154,11 +141,12 @@ app.post("/api/register/verify", async (req, res) => {
       credentialID: credential.id,
       publicKey: Buffer.from(credential.publicKey).toString("base64"),
       counter: credential.counter,
-      name: req.body.nickname || `패스키 ${user.credentials.length + 1}`,
+      name: nickname || `패스키 ${user.credentials.length + 1}`,
       createdAt: new Date().toISOString(),
     });
     saveDB(db);
     pendingChallenges.delete("reg:" + userId);
+    pendingSessions.delete(regToken);
     seedPrivateContent(user.id, user.username);
 
     res.json({ verified: true });
@@ -183,33 +171,36 @@ app.post("/api/login/options", async (req, res) => {
   });
 
   pendingChallenges.set("auth:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
-  req.session.pendingUserId = user.id;
 
-  res.json(options);
+  const loginToken = newToken();
+  pendingSessions.set(loginToken, { userId: user.id, createdAt: Date.now() });
+
+  res.json({ ...options, loginToken });
 });
 
 // ---- 로그인: 2) 응답 검증 -----------------------------------------------
 app.post("/api/login/verify", async (req, res) => {
-  const userId = req.session.pendingUserId;
-  if (!userId) return res.status(400).json({ error: "로그인 세션이 없습니다." });
+  const { authResp, loginToken } = req.body;
+  const pendingSession = loginToken && pendingSessions.get(loginToken);
+  if (!pendingSession) return res.status(400).json({ error: "로그인 세션이 없습니다." });
+  const userId = pendingSession.userId;
 
   const pending = pendingChallenges.get("auth:" + userId);
   if (!pending) return res.status(400).json({ error: "만료되었거나 없는 challenge입니다." });
 
-  // 이미 쓴 challenge 재사용 방지
   if (usedChallenges.has(pending.challenge)) {
     return res.status(400).json({ error: "이미 사용된 challenge입니다." });
   }
 
   const db = loadDB();
   const user = db.users[userId];
-  const credId = req.body.authResp.id;
+  const credId = authResp.id;
   const cred = user.credentials.find((c) => c.credentialID === credId);
   if (!cred) return res.status(400).json({ error: "등록되지 않은 패스키입니다." });
 
   try {
     const verification = await verifyAuthenticationResponse({
-      response: req.body.authResp,
+      response: authResp,
       expectedChallenge: pending.challenge,
       expectedOrigin: ORIGIN,
       expectedRPID: RP_ID,
@@ -229,12 +220,12 @@ app.post("/api/login/verify", async (req, res) => {
 
     usedChallenges.add(pending.challenge);
     pendingChallenges.delete("auth:" + userId);
+    pendingSessions.delete(loginToken);
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    delete req.session.pendingUserId;
+    const sessionToken = newToken();
+    authSessions.set(sessionToken, { userId: user.id, username: user.username, createdAt: Date.now() });
 
-    res.json({ verified: true, username: user.username });
+    res.json({ verified: true, username: user.username, sessionToken });
   } catch (e) {
     res.status(400).json({ error: String(e) });
   }
@@ -242,27 +233,26 @@ app.post("/api/login/verify", async (req, res) => {
 
 // ---- 로그아웃 ----------------------------------------------------------
 app.post("/api/logout", (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  const token = getBearerToken(req);
+  if (token) authSessions.delete(token);
+  res.json({ ok: true });
 });
 
 // ---- 내 패스키 목록 / 삭제 -----------------------------------------------
 app.get("/api/passkeys", requireAuth, (req, res) => {
   const db = loadDB();
-  const user = db.users[req.session.userId];
-  res.json(
-    user.credentials.map((c) => ({ id: c.credentialID, name: c.name, createdAt: c.createdAt }))
-  );
+  const user = db.users[req.userId];
+  res.json(user.credentials.map((c) => ({ id: c.credentialID, name: c.name, createdAt: c.createdAt })));
 });
 
 app.delete("/api/passkeys/:credentialID", requireAuth, (req, res) => {
   const db = loadDB();
-  const user = db.users[req.session.userId];
+  const user = db.users[req.userId];
   const before = user.credentials.length;
   user.credentials = user.credentials.filter((c) => c.credentialID !== req.params.credentialID);
   saveDB(db);
   if (user.credentials.length === before) return res.status(404).json({ error: "없음" });
   if (user.credentials.length === 0) {
-    // 마지막 패스키를 지우면 더 이상 로그인할 방법이 없다 -> 안내만 하고 세션은 유지
     return res.json({ ok: true, warning: "마지막 패스키를 삭제했습니다. 더 이상 이 계정으로 로그인할 수 없습니다." });
   }
   res.json({ ok: true });
@@ -270,12 +260,14 @@ app.delete("/api/passkeys/:credentialID", requireAuth, (req, res) => {
 
 // ---- 비공개 자료 -----------------------------------------------------
 app.get("/api/private", requireAuth, (req, res) => {
-  const items = PRIVATE_CONTENT[req.session.userId] || [];
-  res.json({ username: req.session.username, items });
+  const items = PRIVATE_CONTENT[req.userId] || [];
+  res.json({ username: req.username, items });
 });
 
 app.get("/api/me", (req, res) => {
-  res.json({ loggedIn: !!req.session.userId, username: req.session.username || null });
+  const token = getBearerToken(req);
+  const session = token && authSessions.get(token);
+  res.json({ loggedIn: !!session, username: session?.username || null });
 });
 
 app.listen(PORT, () => console.log(`listening on ${PORT}`));
