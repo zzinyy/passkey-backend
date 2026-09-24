@@ -288,4 +288,11 @@ app.get("/api/me", (req, res) => {
   res.json({ loggedIn: !!session, username: session?.username || null });
 });
 
+// 디버그용: 프론트 라이브러리 버전을 서버와 정확히 맞추기 위해 실제 설치된 버전을 확인
+app.get("/api/debug/version", (req, res) => {
+  res.json({
+    "@simplewebauthn/server": require("@simplewebauthn/server/package.json").version,
+  });
+});
+
 app.listen(PORT, () => console.log(`listening on ${PORT}`));
