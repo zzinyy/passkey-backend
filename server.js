@@ -104,6 +104,7 @@ app.post("/api/register/options", async (req, res) => {
       userVerification: "preferred",
       authenticatorAttachment: "platform", // 이 기기(노트북/휴대폰 내장 인증기)만 사용, 다른 기기로 유도 안 함
     },
+    hints: ["client-device"], // 브라우저에게 "QR/다른 기기 말고 이 기기부터 써라"라고 명시
   });
 
   pendingChallenges.set("reg:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
@@ -187,6 +188,7 @@ app.post("/api/login/options", async (req, res) => {
       type: "public-key",
       transports: c.transports && c.transports.length ? c.transports : undefined,
     })),
+    hints: ["client-device"], // 브라우저에게 "QR/다른 기기 말고 이 기기부터 써라"라고 명시
   });
 
   pendingChallenges.set("auth:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
