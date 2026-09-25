@@ -99,7 +99,11 @@ app.post("/api/register/options", async (req, res) => {
     userName: user.username,
     attestationType: "none",
     excludeCredentials: user.credentials.map((c) => ({ id: c.credentialID, type: "public-key" })),
-    authenticatorSelection: { residentKey: "preferred", userVerification: "preferred" },
+    authenticatorSelection: {
+      residentKey: "preferred",
+      userVerification: "preferred",
+      authenticatorAttachment: "platform", // 이 기기(노트북/휴대폰 내장 인증기)만 사용, 다른 기기로 유도 안 함
+    },
   });
 
   pendingChallenges.set("reg:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
@@ -150,6 +154,7 @@ app.post("/api/register/verify", async (req, res) => {
       credentialID: cred.id,
       publicKey: Buffer.from(cred.publicKey).toString("base64"),
       counter: cred.counter,
+      transports: attResp.response?.transports || [],
       name: nickname || `패스키 ${user.credentials.length + 1}`,
       createdAt: new Date().toISOString(),
     });
@@ -177,7 +182,11 @@ app.post("/api/login/options", async (req, res) => {
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
     userVerification: "preferred",
-    allowCredentials: user.credentials.map((c) => ({ id: c.credentialID, type: "public-key" })),
+    allowCredentials: user.credentials.map((c) => ({
+      id: c.credentialID,
+      type: "public-key",
+      transports: c.transports && c.transports.length ? c.transports : undefined,
+    })),
   });
 
   pendingChallenges.set("auth:" + user.id, { challenge: options.challenge, createdAt: Date.now() });
