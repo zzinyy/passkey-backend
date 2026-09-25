@@ -142,11 +142,10 @@ app.post("/api/register/verify", async (req, res) => {
     }
 
     const info = verification.registrationInfo;
-    // @simplewebauthn/server 버전에 따라 registrationInfo의 필드 이름이 다르다.
-    // 신버전: info.credential.{id, publicKey, counter}
-    // 구버전: info.credentialID / info.credentialPublicKey / info.counter
+    // @simplewebauthn/server v10.0.1 실제 동작: info.credentialID는 이미 base64url 문자열이다.
+    // (Buffer로 다시 감싸서 재인코딩하면 실제 브라우저가 아는 ID와 달라져 로그인이 실패한다 - 이전 버그)
     const cred = info.credential ?? {
-      id: Buffer.from(info.credentialID).toString("base64url"),
+      id: info.credentialID,
       publicKey: info.credentialPublicKey,
       counter: info.counter,
     };
